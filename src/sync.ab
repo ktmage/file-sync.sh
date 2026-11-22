@@ -1,0 +1,148 @@
+import { lock_sync_writes } from "mirror.ab"
+import { confirm, ensure_directory, error, file_exists, lock_file, write_file } from "io.ab"
+import { canonical_file, find_target, load_plugin, plugin_call } from "targets.ab"
+
+fun local_document(path: Text): Text {
+    const result = $ /usr/bin/jq -nce --rawfile raw "{path}" '
+      def document: capture("^# (?<title>[^\\r\\n]+)(?:\\r?\\n|\\\\z)(?<body>[\\\\s\\\\S]*)\\\\z");
+      (if (\$raw | test("^---\\r?\\n")) then \$raw | capture("^(?<front>---\\r?\\n(?:[^\\n]*\\n)*?---(?:\\r?\\n|\\\\z))(?<doc>[\\\\s\\\\S]*)\\\\z")
+       else \{front:"",doc:\$raw} end) as \$split
+      | (\$split.doc | sub("^(?:\\r?\\n)*"; "") | document) + \{front:\$split.front,raw:\$raw}
+    ' $ failed { error("Markdown must have an initial # heading: {path}") }
+    if result == "" { error("Markdown must have an initial # heading: {path}") }
+    return result
+}
+
+fun write_markdown(path: Text, value: Text) {
+    const mode = $ /usr/bin/stat -f "%Lp" -- "{path}" $ failed { error("Could not read permissions: {path}") }
+    const temp = $ /usr/bin/mktemp "{path}.XXXXXX" $ failed { error("Could not stage: {path}") }
+    $ printf '%s' "{value}" | /usr/bin/jq -ej '.' > "{temp}" &&
+        /bin/chmod "{mode}" "{temp}" && /bin/mv -f -h -- "{temp}" "{path}" $ failed {
+        trust $ /bin/rm -f -- "{temp}" $
+        error("Could not save: {path}")
+    }
+}
+
+fun state_records(path: Text): Text {
+    if not file_exists(path) { return "[]" }
+    $ test -f "{path}" && test ! -L "{path}" $ failed { error("Invalid sync record: {path}") }
+    const result = $ /usr/bin/jq -ces 'select(length == 1) | .[0] | select(type == "array" and all(.[]; type == "object" and (.target | type == "object") and (.baseline.title | type == "string") and (.baseline.body | type == "string")))' -- "{path}" $ failed {
+        error("Invalid sync record: {path}")
+    }
+    return result
+}
+
+fun record_sync(state: Text, target: Text, baseline: Text) {
+    const file = "{state}/state.json"
+    const current = state_records(file)
+    const now = $ /bin/date -u '+%Y-%m-%dT%H:%M:%SZ' $ failed { error("Could not read the clock") }
+    const updated = $ printf '%s\n' "{current}" "{target}" "{baseline}" | /usr/bin/jq -cs --arg now "{now}" '
+        .[1] as \$target | .[2] as \$baseline
+        | (.[0] | map(select(.target != \$target))) + [\{\$target,\$baseline,syncedAt:\$now}]
+    ' $ failed { error("Could not update sync record") }
+    write_file(file, updated)
+}
+
+fun normalized(doc: Text): Text {
+    const payload = $ printf '%s' "{doc}" | /usr/bin/jq -ce '
+        \{title, body:(.body | gsub("\\r\\n"; "\\n") | rtrimstr("\\n"))}
+    ' $ failed { error("Could not read Markdown") }
+    return payload
+}
+
+fun read_remote(plugin: Text, url: Text): Text {
+    const response = plugin_call(plugin, "read", url)
+    const document = $ /usr/bin/jq -ce '
+        select((.title | type == "string" and test("^[^\\r\\n\\u0000]+\\\\z"))
+          and (.body | type == "string" and (contains("\\u0000") | not)))
+        | \{title,body}
+    ' <<< "{response}" $ failed { error("Plugin did not return a Markdown title and body") }
+    return document
+}
+
+fun diff_document(before: Text, after: Text, before_label: Text, after_label: Text) {
+    // jq writes the Markdown to diff through pipes, preserving escaping in JSON.
+    $ /usr/bin/diff -u -L "{before_label}" -L "{after_label}" \
+        <(printf '%s' "{before}" | /usr/bin/jq -r '"# " + .title + "\\n" + .body') \
+        <(printf '%s' "{after}" | /usr/bin/jq -r '"# " + .title + "\\n" + .body') $ failed {
+        if status() != 1 { error("Could not compare documents") }
+    }
+}
+
+fun saved_baseline(state: Text, target: Text): Text {
+    const current = state_records("{state}/state.json")
+    const value = $ printf '%s\n' "{current}" "{target}" | /usr/bin/jq -cs '.[1] as \$target | [.[0][] | select(.target == \$target) | .baseline] | last' $ failed { error("Could not read the comparison baseline") }
+    return value
+}
+
+fun compare_status(local: Text, remote: Text, baseline: Text): Text {
+    const result = $ printf '%s\n' "{local}" "{remote}" "{baseline}" | /usr/bin/jq -rs '
+        .[0] as \$local | .[1] as \$remote | .[2] as \$base
+        | if \$local == \$remote then "equal"
+          elif \$base == null then "untracked-difference"
+          elif \$local != \$base and \$remote != \$base then "conflict"
+          elif \$local != \$base then "local-changed"
+          else "remote-changed" end
+    ' $ failed { error("Could not compare sync states") }
+    return result
+}
+
+pub fun sync_document(config: Text, state: Text, action: Text, input: Text, option: Bool) {
+    const path = canonical_file(input)
+    if action != "status" {
+        ensure_directory(config)
+        lock_file("{config}/.targets.lock")
+    }
+    const target = find_target("{config}/targets.json", path)
+    const url = $ /usr/bin/jq -er '.url' <<< "{target}" $ failed { error("Target URL missing") }
+    const id = $ /usr/bin/jq -er '.plugin' <<< "{target}" $ failed { error("Target plugin missing") }
+    const plugin = load_plugin(config, id)
+    const body = local_document(path)
+    const response = read_remote(plugin, url)
+    const local = normalized(body)
+    const remote = normalized(response)
+    const baseline = saved_baseline(state, target)
+    const change = compare_status(local, remote, baseline)
+    if action == "status" {
+        echo(change)
+        if option and change != "equal" {
+            if baseline == "null" {
+                diff_document(local, remote, "local", "remote")
+            } else {
+                diff_document(baseline, local, "last sync", "local")
+                diff_document(baseline, remote, "last sync", "remote")
+            }
+        }
+        exit(0)
+    }
+    ensure_directory(state)
+    if change == "equal" {
+        lock_sync_writes(state)
+        record_sync(state, target, local)
+        echo("equal")
+        exit(0)
+    }
+    if action == "push" {
+        diff_document(remote, local, "remote", "proposed remote")
+        echo(url)
+        error("Apply the displayed change at the sync target, then run push again to record the match")
+    }
+    diff_document(local, remote, "local", "proposed local")
+    if change != "remote-changed" and not option { error("Use --overwrite to select the remote content explicitly") }
+    confirm("Apply this change to {path}?")
+    lock_sync_writes(state)
+    const current = local_document(path)
+    const current_remote = read_remote(plugin, url)
+    if current != body or current_remote != response { error("Contents changed; review the new diff before applying") }
+    ensure_directory("{state}/backup")
+    const backup = $ /usr/bin/mktemp "{state}/backup/document.XXXXXX" $ failed { error("Could not stage backup") }
+    $ /bin/cp -- "{path}" "{backup}" $ failed { error("Could not save backup") }
+    const updated = $ printf '%s\n' "{body}" "{response}" | /usr/bin/jq -cs '
+        (.[0].front | if . == "" or endswith("\\n") then . else . + "\\n" end) + "# " + .[1].title + "\\n" + .[1].body
+    ' $ failed { error("Could not render Markdown") }
+    write_markdown(path, updated)
+    const saved = normalized(local_document(path))
+    if saved != remote { error("Saved Markdown does not match the sync target; backup: {backup}") }
+    record_sync(state, target, remote)
+    echo(path)
+}

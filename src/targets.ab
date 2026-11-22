@@ -1,0 +1,118 @@
+import { error, file_exists, lock_file, real_path, ensure_directory, write_file } from "io.ab"
+
+pub fun stored_targets(path: Text): Text {
+    if not file_exists(path) { return "\{\"version\":1,\"targets\":[]}" }
+    $ test -f "{path}" && test ! -L "{path}" $ failed { error("Invalid targets file: {path}") }
+    const targets = $ /usr/bin/jq -ces '
+        if length == 1 and (.[0] | .version == 1 and (.targets | type == "array" and all(.[];
+          type == "object" and (.path | type == "string" and startswith("/")) and
+          (.plugin | type == "string" and test("^[a-z0-9][a-z0-9-]*\\\\z")) and (.url | type == "string" and startswith("https://"))
+        ) and (map(.path) | length == (unique | length)) and (map(.url) | length == (unique | length))))
+        then .[0] else error("Invalid file-sync registry") end
+    ' -- "{path}" $ failed { error("Invalid targets file: {path}") }
+    return targets
+}
+
+pub fun canonical_file(file: Text): Text {
+    const path = silent real_path(file) failed { error("File not found: {file}") }
+    $ test -f "{path}" && [[ "{path}" == *.[mM][dD] ]] $ failed { error("Expected a regular Markdown file: {file}") }
+    return path
+}
+
+pub fun registered_path(input: Text): Text {
+    const path = silent real_path(input) failed {
+        $ [[ "{input}" == /* ]] $ failed { error("Use the registered absolute path for a missing file", 2) }
+        return input
+    }
+    return path
+}
+
+pub fun find_target(file: Text, path: Text): Text {
+    const targets = stored_targets(file)
+    const target = $ /usr/bin/jq -cer --arg path "{path}" '.targets[] | select(.path == \$path)' <<< "{targets}" $ failed {
+        error("File has no registered sync target: {path}")
+    }
+    return target
+}
+
+pub fun load_plugin(config: Text, id: Text): Text {
+    $ LC_ALL=C; [[ "{id}" =~ ^[a-z0-9][a-z0-9-]*\$ ]] $ failed { error("Invalid plugin ID: {id}", 2) }
+    const path = "{config}/plugins/{id}.json"
+    $ test -f "{path}" $ failed { error("Plugin configuration not found: {path}") }
+    const manifest = $ /usr/bin/jq -ces '
+        select(length == 1) | .[0] | select(type == "object"
+          and (.command | type == "string" and (startswith("/") or startswith("~/"))
+          and (test("[[:cntrl:]]") | not))
+          and (if has("settings") then (.settings | type == "object") else true end))
+    ' -- "{path}" $ failed { error("Invalid plugin configuration: {path}") }
+    const command = $ /usr/bin/jq -er '.command' <<< "{manifest}" $ failed { error("Missing plugin command: {id}") }
+    let tool = command
+    $ [[ "{command}" == "~/"* ]] $ succeeded {
+        tool = $ value="{command}"; printf '%s/%s' "\$HOME" "\$\{value:2}" $ failed { error("Invalid plugin command: {id}") }
+    }
+    $ test -f "{tool}" && test -x "{tool}" $ failed { error("Plugin command is not executable: {tool}") }
+    const plugin = $ /usr/bin/jq -ce --arg tool "{tool}" '\{command:\$tool,settings:(.settings // \{})}' <<< "{manifest}" $ failed {
+        error("Could not read plugin settings: {id}")
+    }
+    return plugin
+}
+
+pub fun plugin_call(plugin: Text, operation: Text, url: Text): Text {
+    const tool = $ /usr/bin/jq -er '.command' <<< "{plugin}" $ failed { error("Missing plugin command") }
+    const request = $ /usr/bin/jq -ce --arg op "{operation}" --arg url "{url}" '
+        \{version:1, operation:\$op, url:\$url, settings}
+    ' <<< "{plugin}" $ failed { error("Could not build plugin request") }
+    const response = $ printf '%s\n' "{request}" | "{tool}" $ failed { error("Plugin failed: {operation}") }
+    const result = $ printf '%s' "{response}" | /usr/bin/jq -ces '
+        select(length == 1) | .[0] | select(.version == 1 and (.result | type == "object")) | .result
+    ' $ failed { error("Invalid plugin response: {operation}") }
+    return result
+}
+
+pub fun link_target(config: Text, id: Text, input: Text, url: Text) {
+    const file = canonical_file(input)
+    const plugin = load_plugin(config, id)
+    const source = $ /usr/bin/jq -ner --arg url "{url}" '
+        \$url | select(test("^https://[^/[:space:][:cntrl:]]+[^[:space:][:cntrl:]]*\\\\z"))
+    ' $ failed { error("Expected a HTTPS URL: {url}", 2) }
+    const resolved = plugin_call(plugin, "resolve", source)
+    const target = $ /usr/bin/jq -ce --arg path "{file}" --arg plugin "{id}" '
+        select(.url | type == "string" and test("^https://[^/[:space:][:cntrl:]]+[^[:space:][:cntrl:]]*\\\\z"))
+        | \{\$path, \$plugin, url:.url}
+    ' <<< "{resolved}" $ failed { error("Plugin did not return a valid HTTPS URL") }
+    ensure_directory(config)
+    lock_file("{config}/.targets.lock")
+    const registry = "{config}/targets.json"
+    const current = stored_targets(registry)
+    const updated = $ printf '%s\n' "{current}" "{target}" | /usr/bin/jq -ces '
+        .[0] as \$current | .[1] as \$target
+        | if any(\$current.targets[]; . == \$target) then \$current
+          elif any(\$current.targets[]; .path == \$target.path or .url == \$target.url) then error("File or URL already registered")
+          else \$current | .targets += [\$target] end
+    ' $ failed { error("Could not register: {file}") }
+    if updated != current { write_file(registry, updated) }
+    echo(file)
+}
+
+pub fun unlink_target(config: Text, input: Text) {
+    const path = registered_path(input)
+    ensure_directory(config)
+    lock_file("{config}/.targets.lock")
+    const registry = "{config}/targets.json"
+    const current = stored_targets(registry)
+    const updated = $ /usr/bin/jq -ce --arg path "{path}" '
+        if any(.targets[]; .path == \$path) then .targets |= map(select(.path != \$path))
+        else error("File has no registered sync target") end
+    ' <<< "{current}" $ failed { error("Could not unlink: {path}") }
+    write_file(registry, updated)
+    echo(path)
+}
+
+pub fun list_targets(config: Text, as_json: Bool) {
+    const current = stored_targets("{config}/targets.json")
+    if as_json {
+        $ /usr/bin/jq -c '\{targets:(.targets | sort_by(.path))}' <<< "{current}" $ failed { error("Could not list targets") }
+    } else {
+        $ /usr/bin/jq -r '.targets | sort_by(.path) | .[] | [.path,.plugin,.url] | @tsv' <<< "{current}" $ failed { error("Could not list targets") }
+    }
+}

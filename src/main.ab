@@ -1,0 +1,66 @@
+import { mirror_command, mirror_worker } from "mirror.ab"
+import { env_or, error } from "io.ab"
+import { link_target, list_targets, unlink_target } from "targets.ab"
+import { sync_document } from "sync.ab"
+
+fun usage() {
+    echo("Usage: file-sync link <file> <url> --plugin <id> | unlink <file> | list [--json]")
+    echo("       file-sync status <file> [--diff] | pull <file> [--overwrite] | push <file> [--overwrite]")
+    echo("       file-sync mirror --to <directory> [--write-back] -- <file>...")
+}
+
+main(args) {
+    trust $ umask 077 $
+    const home = env_or("HOME", "")
+    if home == "" { error("HOME is required") }
+    const config = env_or("FILE_SYNC_CONFIG_HOME", "{home}/.config/file-sync")
+    const state = env_or("FILE_SYNC_STATE_HOME", "{home}/.local/state/file-sync")
+    if len(args) == 1 { error("Expected a file-sync command; use --help", 2) }
+    const action = args[1]
+    if action == "mirror" {
+        mirror_command(state, args)
+        exit(0)
+    }
+    if action == "--mirror-worker" {
+        if len(args) != 4 { exit(2) }
+        mirror_worker(state, args[2], args[3])
+        exit(0)
+    }
+    if action == "--help" or action == "-h" {
+        usage()
+        exit(0)
+    }
+    if action == "list" {
+        let as_json = false
+        if len(args) == 3 { as_json = args[2] == "--json" }
+        if len(args) > 3 or (len(args) == 3 and not as_json) { error("Usage: file-sync list [--json]", 2) }
+        list_targets(config, as_json)
+        exit(0)
+    }
+    if action == "unlink" {
+        if len(args) != 3 { error("Usage: file-sync unlink <file>", 2) }
+        unlink_target(config, args[2])
+        exit(0)
+    }
+
+    if action == "link" {
+        if len(args) != 6 or args[4] != "--plugin" {
+            error("Usage: file-sync link <file> <url> --plugin <id>", 2)
+        }
+        link_target(config, args[5], args[2], args[3])
+        exit(0)
+    }
+    if action == "watch" { error("External watch is unavailable; use mirror for local files") }
+    if action == "status" or action == "push" or action == "pull" {
+        let option = false
+        let flag = "--overwrite"
+        if action == "status" { flag = "--diff" }
+        if len(args) == 4 { option = args[3] == flag }
+        if len(args) < 3 or len(args) > 4 or (len(args) == 4 and not option) {
+            error("Usage: file-sync {action} <file> [{flag}]", 2)
+        }
+        sync_document(config, state, action, args[2], option)
+        exit(0)
+    }
+    error("Unknown file-sync command: {action}", 2)
+}
