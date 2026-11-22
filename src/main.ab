@@ -1,15 +1,69 @@
-import { mirror_command, mirror_worker } from "mirror.ab"
+import { job_command } from "jobs.ab"
+import { real_path } from "io.ab"
 import { env_or, error } from "io.ab"
-import { link_target, list_targets, unlink_target } from "targets.ab"
+import { load_plugin, link_target, list_targets, unlink_target } from "targets.ab"
 import { sync_document } from "sync.ab"
 
 fun usage() {
     echo("Usage: file-sync link <file> <url> --plugin <id> | unlink <file> | list [--json]")
     echo("       file-sync status <file> [--diff] | pull <file> [--overwrite] | push <file> [--overwrite]")
+    echo("       file-sync run <job> | job-status <job> | stop <job>")
     echo("       file-sync mirror --to <directory> [--write-back] -- <file>...")
+    echo("       file-sync --check")
+}
+
+fun check_dependencies() {
+    let ready = true
+    const required = [
+        "/bin/bash",
+        "/bin/chmod",
+        "/bin/cp",
+        "/bin/date",
+        "/bin/mkdir",
+        "/bin/mv",
+        "/bin/realpath",
+        "/bin/rm",
+        "/bin/sleep",
+        "/usr/bin/awk",
+        "/usr/bin/basename",
+        "/usr/bin/diff",
+        "/usr/bin/dirname",
+        "/usr/bin/env",
+        "/usr/bin/jq",
+        "/usr/bin/lockf",
+        "/usr/bin/mktemp",
+        "/usr/bin/nohup",
+        "/usr/bin/printenv",
+        "/usr/bin/shasum",
+        "/usr/bin/stat",
+        "/usr/bin/true"
+    ]
+    $ (( BASH_VERSINFO[0] > 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] >= 2) )) $ failed {
+        trust $ printf 'Unsupported Bash %s (requires 3.2 or newer)\n' "\$BASH_VERSION" $
+        ready = false
+    }
+    if ready {
+        trust $ printf 'OK Bash %s\n' "\$BASH_VERSION" $
+    }
+    for path in required {
+        $ test -f "{path}" && test -x "{path}" $ failed {
+            echo("Missing {path}")
+            ready = false
+            continue
+        }
+        echo("OK {path}")
+    }
+
+    echo("Remote Markdown comparison requires the plugin configured for the target.")
+    if not ready { exit(1) }
+    exit(0)
 }
 
 main(args) {
+    if len(args) > 1 and args[1] == "--check" {
+        if len(args) != 2 { error("Usage: file-sync --check", 2) }
+        check_dependencies()
+    }
     trust $ umask 077 $
     const home = env_or("HOME", "")
     if home == "" { error("HOME is required") }
@@ -17,14 +71,23 @@ main(args) {
     const state = env_or("FILE_SYNC_STATE_HOME", "{home}/.local/state/file-sync")
     if len(args) == 1 { error("Expected a file-sync command; use --help", 2) }
     const action = args[1]
-    if action == "mirror" {
-        mirror_command(state, args)
+    if action == "run" or action == "stop" or action == "job-status" or action == "--job-pass" or action == "--job-worker" {
+        if len(args) != 3 { error("Expected one job name", 2) }
+        const script = real_path(args[0]) failed { error("Could not locate file-sync") }
+        job_command(config, state, script, action, args[2])
         exit(0)
     }
-    if action == "--mirror-worker" {
-        if len(args) != 4 { exit(2) }
-        mirror_worker(state, args[2], args[3])
-        exit(0)
+    if action == "mirror" {
+        const plugin = load_plugin(config, "local-mirror")
+        const command = $ /usr/bin/jq -er .command <<< "{plugin}" $ failed { error("Missing local mirror plugin") }
+        let options = []
+        let index = 1
+        while index < len(args) {
+            options += [args[index]]
+            index += 1
+        }
+        const script = real_path(args[0]) failed { error("Could not locate file-sync") }
+        trust $ FILE_SYNC_CLI="{script}" exec "{command}" "{options}" $
     }
     if action == "--help" or action == "-h" {
         usage()
@@ -50,7 +113,6 @@ main(args) {
         link_target(config, args[5], args[2], args[3])
         exit(0)
     }
-    if action == "watch" { error("External watch is unavailable; use mirror for local files") }
     if action == "status" or action == "push" or action == "pull" {
         let option = false
         let flag = "--overwrite"

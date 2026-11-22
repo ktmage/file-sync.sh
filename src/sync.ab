@@ -1,4 +1,4 @@
-import { lock_sync_writes } from "mirror.ab"
+import { lock_sync_writes } from "io.ab"
 import { confirm, ensure_directory, error, file_exists, lock_file, write_file } from "io.ab"
 import { canonical_file, find_target, load_plugin, plugin_call } from "targets.ab"
 
@@ -87,16 +87,18 @@ fun compare_status(local: Text, remote: Text, baseline: Text): Text {
     return result
 }
 
-pub fun sync_document(config: Text, state: Text, action: Text, input: Text, option: Bool) {
+pub fun sync_document(config: Text, state: Text, action: Text, input: Text, option: Bool, configured: Text = "", unattended: Bool = false, backend: Text = "") {
     const path = canonical_file(input)
     if action != "status" {
         ensure_directory(config)
         lock_file("{config}/.targets.lock")
     }
-    const target = find_target("{config}/targets.json", path)
+    let target = configured
+    if target == "" { target = find_target("{config}/targets.json", path) }
     const url = $ /usr/bin/jq -er '.url' <<< "{target}" $ failed { error("Target URL missing") }
     const id = $ /usr/bin/jq -er '.plugin' <<< "{target}" $ failed { error("Target plugin missing") }
-    const plugin = load_plugin(config, id)
+    let plugin = backend
+    if plugin == "" { plugin = load_plugin(config, id) }
     const body = local_document(path)
     const response = read_remote(plugin, url)
     const local = normalized(body)
@@ -117,6 +119,7 @@ pub fun sync_document(config: Text, state: Text, action: Text, input: Text, opti
     }
     ensure_directory(state)
     if change == "equal" {
+        if unattended and baseline == local { exit(0) }
         lock_sync_writes(state)
         record_sync(state, target, local)
         echo("equal")
@@ -125,11 +128,25 @@ pub fun sync_document(config: Text, state: Text, action: Text, input: Text, opti
     if action == "push" {
         diff_document(remote, local, "remote", "proposed remote")
         echo(url)
-        error("Apply the displayed change at the sync target, then run push again to record the match")
+        $ /usr/bin/jq -e '.writable' <<< "{plugin}" > /dev/null $ failed {
+            error("Apply the displayed change at the sync target, then run push again to record the match")
+        }
+        if change != "local-changed" and not option { error("{change}: use --overwrite to select the local content explicitly") }
+        if not unattended { confirm("Apply this change to {url}?") }
+        if local_document(path) != body or read_remote(plugin, url) != response { error("Contents changed; review the new diff before applying") }
+        const payload = $ printf '%s\n' "{response}" "{body}" | /usr/bin/jq -cs '\{expected:.[0],document:(.[1] | \{title,body})}' $ failed { error("Could not prepare the document") }
+        const receipt = plugin_call(plugin, "write", url, payload)
+        $ /usr/bin/jq -e '.written == true' <<< "{receipt}" > /dev/null $ failed { error("Plugin did not confirm the write") }
+        lock_sync_writes(state)
+        const saved_remote = normalized(read_remote(plugin, url))
+        if saved_remote != local or local_document(path) != body { error("Contents differ after writing; check status before retrying") }
+        record_sync(state, target, local)
+        echo("equal")
+        exit(0)
     }
     diff_document(local, remote, "local", "proposed local")
     if change != "remote-changed" and not option { error("Use --overwrite to select the remote content explicitly") }
-    confirm("Apply this change to {path}?")
+    if not unattended { confirm("Apply this change to {path}?") }
     lock_sync_writes(state)
     const current = local_document(path)
     const current_remote = read_remote(plugin, url)

@@ -49,3 +49,11 @@ pub fun confirm(message: Text) {
         error("Cancelled")
     }
 }
+
+pub fun lock_sync_writes(state: Text) {
+    ensure_directory(state)
+    const path = "{state}/.write.lock"
+    $ test ! -L "{path}" && exec 7>>"{path}" && /usr/bin/lockf -t 15 7 $ failed {
+        error("Could not acquire the file write lock: {path}")
+    }
+}

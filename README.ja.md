@@ -6,11 +6,19 @@
 
 [English](README.md)
 
-ローカルファイルのコピーを最新に保ち、手元のMarkdownと同期先の差分を確認するmacOS向けCLIです。
+同期先をプラグインで選び、ジョブごとに手動実行か監視を設定するmacOS向けCLIです。GitHubとローカルミラーは独立したリポジトリで開発し、標準プラグインとして同梱します。
 
-**ローカルのミラーはBashとmacOS標準コマンドで動きます。** 同期先のMarkdownとの比較には、サービスに対応するプラグインを使います。Amberが必要なのは[ソースからビルドする](#ソースからビルドする)ときだけです。
+本体とローカルミラーはBashとmacOS標準コマンドで動きます。Amberは[ソースからビルドする](#ソースからビルドする)ときに使います。
 
 ## 動作環境
+
+インストール後は、次のコマンドでBashと必要なコマンドが揃っているか確認できます。
+
+```sh
+file-sync --check
+```
+
+同期先との比較を設定するときは、使うプラグインの動作環境も確認します。
 
 同梱のシェルスクリプトは、Bash 3.2以降と`/usr/bin/jq`、`/usr/bin/lockf`、`/bin/realpath`などの標準コマンドが使えるmacOSで動作します。ミラーでは`/usr/bin/shasum`で変更を検出し、Markdownの比較では`/usr/bin/diff`で差分を出します。
 
@@ -18,15 +26,21 @@
 
 ## 使ってみる
 
-リポジトリのルートで実行すると、サンプルファイルのミラーが起動します。`--status`で元ファイルとコピーの絶対パスを確認できます。`--stop`で停止してもコピーは残ります。
+リポジトリのルートで、作例専用の設定と保存先を用意します。設定の `mode` を `manual` にすると、同じコマンドで1回だけ同期します。
 
 ```sh
+git submodule update --init -- plugins/github plugins/local-mirror
 export PATH="$PWD/bin:$PATH"
 demo=$(mktemp -d)
-printf '# サンプル\n\n元の本文。\n' > "$demo/spec.md"
-file-sync mirror --to "$demo/mirror" -- "$demo/spec.md"
-file-sync mirror --status --to "$demo/mirror"
-file-sync mirror --stop --to "$demo/mirror"
+export FILE_SYNC_CONFIG_HOME="$demo/config" FILE_SYNC_STATE_HOME="$demo/state"
+mkdir -p "$demo/config/plugins" "$demo/config/jobs"
+jq -n --arg command "$PWD/plugins/local-mirror/plugin.sh" '{command:$command,protocol:"sync"}' > "$demo/config/plugins/local-mirror.json"
+printf 'example\n' > "$demo/note.txt"
+jq -n --arg src "$demo/note.txt" --arg dst "$demo/copies" \
+  '{plugin:"local-mirror",mode:"watch",settings:{files:[$src],destination:$dst}}' > "$demo/config/jobs/notes.json"
+file-sync run notes
+file-sync job-status notes
+file-sync stop notes
 ```
 
 ## コマンドをインストールする
@@ -39,6 +53,18 @@ install -m 755 file-sync.sh "$HOME/.local/bin/file-sync"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+チェックアウトから2つの標準プラグインを配置する。会社用dotfilesはこの配置をインストール時に行う。
+
+```sh
+git submodule update --init -- plugins/github plugins/local-mirror
+mkdir -p "$HOME/.config/file-sync/plugins"
+for name in github local-mirror; do
+  mkdir -p "$HOME/.tools/file-sync-plugins/$name"
+  ln -s "$PWD/plugins/$name/plugin" "$HOME/.tools/file-sync-plugins/$name/plugin"
+  cp -n "plugins/$name/manifest.json" "$HOME/.config/file-sync/plugins/$name.json"
+done
+```
+
 ## 同期先のMarkdownと比較する
 
 利用するサービスを読み取る[プラグインを設定](docs/external-spec.ja.md#プラグインとの通信)します。設定したらローカルのMarkdownにHTTPSのURLを関連付け、差分を確認します。
@@ -49,7 +75,7 @@ file-sync status ./spec.md --diff
 file-sync pull ./spec.md
 ```
 
-`pull`は差分を表示し、確認を受けてローカルファイルを更新します。`push`は変更案と同期先URLを表示します。同期先で内容を反映してからもう一度`push`を実行すると、一致した内容を記録します。
+`pull`は確認後に手元のファイルを更新します。`push`は差分とURLを表示します。書き込み対応のプラグインでは、確認後に同期先へ反映し、保存された内容を照合します。読み取り専用のプラグインでは、表示された差分を同期先で適用してから再度`push`で一致を記録します。
 
 ## ドキュメント
 
@@ -62,7 +88,8 @@ Amber 0.6.0-alphaを用意し、リポジトリのルートで実行します。
 
 ```sh
 amber build --target bash-3.2 --no-proc bshchk src/main.ab file-sync.sh
-/bin/bash -n file-sync.sh
+(cd plugins/local-mirror && amber build --target bash-3.2 --no-proc bshchk src/main.ab plugin.sh)
+/bin/bash -n file-sync.sh && /bin/bash -n plugins/local-mirror/plugin.sh
 ```
 
 ## ライセンス

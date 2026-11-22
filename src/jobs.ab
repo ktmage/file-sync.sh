@@ -1,0 +1,121 @@
+import { ensure_directory, error, file_exists } from "io.ab"
+import { canonical_file, load_plugin, plugin_call } from "targets.ab"
+import { sync_document } from "sync.ab"
+
+fun read_job(config: Text, name: Text): Text {
+    const path = "{config}/jobs/{name}.json"
+    const job = $ /usr/bin/jq -ces '
+        select(length == 1) | .[0] | select(type == "object"
+          and (.plugin | type == "string") and (.mode == "manual" or .mode == "watch")
+          and (.settings | type == "object")
+          and (if has("intervalSeconds") then (.intervalSeconds | type == "number" and . == floor and . >= 1 and . <= 86400) else true end))
+    ' -- "{path}" $ failed { error("Invalid job: {path}") }
+    const id = $ /usr/bin/jq -r .plugin <<< "{job}" $ failed { error("Missing plugin") }
+    const plugin = load_plugin(config, id)
+    const mode = $ /usr/bin/jq -r .mode <<< "{job}" $ failed { error("Missing job mode") }
+    $ /usr/bin/jq -e --arg mode "{mode}" '.allowedModes | index(\$mode) != null' <<< "{plugin}" > /dev/null $ failed {
+        error("Plugin {id} does not allow job mode: {mode}")
+    }
+    const plan = $ printf '%s\n' "{job}" "{plugin}" | /usr/bin/jq -cs '
+        .[0] as \$job | .[1] as \$manifest | \$job + \{backend:(\$manifest + \{settings:(\$manifest.settings + \$job.settings)})}
+    ' $ failed { error("Invalid plugin settings") }
+    return plan
+}
+
+fun run_pass(config: Text, state: Text, plan: Text) {
+    const plugin = $ /usr/bin/jq -c .backend <<< "{plan}" $ failed { error("Missing plugin") }
+    $ /usr/bin/jq -e '.protocol == "sync"' <<< "{plugin}" > /dev/null $ succeeded {
+        const result = plugin_call(plugin, "sync", "")
+        $ /usr/bin/jq -e '.synced == true' <<< "{result}" > /dev/null $ failed { error("Plugin did not complete synchronization") }
+        exit(0)
+    }
+    const file = $ /usr/bin/jq -er '.backend.settings.file | select(type == "string" and startswith("/") and (test("[[:cntrl:]]") | not))' <<< "{plan}" $ failed { error("Expected an absolute Markdown file path") }
+    const path = canonical_file(file)
+    const url = $ /usr/bin/jq -er '.backend.settings.url | select(type == "string" and test("^https://[^[:space:][:cntrl:]]+\$"))' <<< "{plan}" $ failed { error("Expected an HTTPS URL") }
+    const action = $ /usr/bin/jq -er '.backend.settings.direction | select(. == "push" or . == "pull")' <<< "{plan}" $ failed { error("Expected direction pull or push") }
+    const mode = $ /usr/bin/jq -r .mode <<< "{plan}" $ failed { error("Missing mode") }
+    if mode == "watch" and action == "push" {
+        $ /usr/bin/jq -e '.writable and .backgroundWrite' <<< "{plugin}" > /dev/null $ failed { error("Plugin does not support unattended writes") }
+    }
+    const resolved = plugin_call(plugin, "resolve", url)
+    const target = $ printf '%s\n' "{plan}" "{resolved}" | /usr/bin/jq -ces --arg path "{path}" '
+        select(.[1].url | type == "string" and test("^https://[^[:space:][:cntrl:]]+\$"))
+        | \{path:\$path,plugin:.[0].plugin,url:.[1].url}
+    ' $ failed { error("Plugin returned an invalid URL") }
+    sync_document(config, state, action, path, false, target, mode == "watch", plugin)
+}
+
+fun active(dir: Text): Bool {
+    $ /usr/bin/lockf -k -s -t 0 "{dir}/worker.lock" /usr/bin/true $ failed {
+        if status() == 75 { return true }
+        error("Could not check job lock")
+    }
+    return false
+}
+
+pub fun job_command(config: Text, state: Text, script: Text, action: Text, name: Text) {
+    $ LC_ALL=C; [[ "{name}" =~ ^[a-z0-9][a-z0-9-]*\$ ]] $ failed { error("Invalid job name", 2) }
+    const dir = "{state}/jobs/{name}"
+    ensure_directory(dir)
+    if action == "--job-worker" {
+        $ exec 8>>"{dir}/worker.lock" && /usr/bin/lockf -s -t 0 8 $ failed { error("Job already running") }
+        const plan = $ /usr/bin/jq -ce . $ failed { error("Missing job snapshot") }
+        $ FILE_SYNC_RUN_DIR=\$(/usr/bin/mktemp -d "{dir}/run.XXXXXX") && export FILE_SYNC_RUN_DIR &&
+            trap '/bin/rm -rf -- "\$FILE_SYNC_RUN_DIR"' EXIT $ failed { error("Could not prepare the watch session") }
+        const interval = $ /usr/bin/jq -r '.intervalSeconds // 5' <<< "{plan}" $ failed { error("Invalid interval") }
+        loop {
+            if file_exists("{dir}/stop") { exit(0) }
+            $ /bin/bash "{script}" --job-pass "{name}" <<< "{plan}" > /dev/null $ failed { error("Job stopped after a failed pass") }
+            $ : > "{dir}/ready" $ failed { error("Could not record job start") }
+            let elapsed = 0
+            loop {
+                if file_exists("{dir}/stop") { exit(0) }
+                $ test "{elapsed}" -lt "{interval}" $ failed { break }
+                trust $ /bin/sleep 1 $
+                elapsed += 1
+            }
+        }
+    }
+    if action == "--job-pass" {
+        const plan = read_job(config, name)
+        const snapshot = $ /usr/bin/jq -ce . $ failed { error("Missing worker settings") }
+        if plan != snapshot { error("Job configuration changed") }
+        run_pass(config, state, plan)
+        exit(0)
+    }
+    $ exec 6>>"{dir}/control.lock" && /usr/bin/lockf -t 15 6 $ failed { error("Could not lock job") }
+    if action == "job-status" {
+        const running = active(dir)
+        $ /usr/bin/jq -nc --arg job "{name}" --argjson running "{running}" --arg log "{dir}/worker.log" '\{job:\$job,running:(\$running == 1),log:\$log}' $ failed { error("Could not display job state") }
+        exit(0)
+    }
+    if action == "stop" {
+        $ : > "{dir}/stop" $ failed { error("Could not request job stop") }
+        for _attempt in 0..50 {
+            if not active(dir) { exit(0) }
+            trust $ /bin/sleep 0.1 $
+        }
+        error("Stop requested; waiting for the current plugin call to finish")
+    }
+    const plan = read_job(config, name)
+    if active(dir) { error("Job already running; stop it before restarting") }
+    $ /usr/bin/jq -e '.mode == "manual"' <<< "{plan}" > /dev/null $ succeeded {
+        run_pass(config, state, plan)
+        exit(0)
+    }
+    trust $ /bin/rm -f -- "{dir}/stop" "{dir}/ready" $
+    const pid = $ (exec 6>&-; exec /usr/bin/nohup /bin/bash "{script}" --job-worker "{name}") <<< "{plan}" >"{dir}/worker.log" 2>&1 & printf '%s' "\$!" $ failed { error("Could not start job") }
+    for _attempt in 0..50 {
+        if file_exists("{dir}/ready") {
+            echo(name)
+            exit(0)
+        }
+        $ kill -0 "{pid}" 2>/dev/null $ failed { error("Job failed; see {dir}/worker.log") }
+        trust $ /bin/sleep 0.1 $
+    }
+    if active(dir) {
+        echo("Starting {name}; see {dir}/worker.log")
+        exit(0)
+    }
+    error("Job did not start; see {dir}/worker.log")
+}

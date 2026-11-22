@@ -6,11 +6,19 @@
 
 [日本語](README.ja.md)
 
-A macOS CLI for keeping copies of local files up to date and comparing local Markdown with a remote copy.
+Synchronize files on macOS with manual or watched jobs. GitHub and local mirror are standard plugins, maintained in independent repositories and included as Git submodules.
 
-**Local mirroring runs with Bash and standard macOS commands.** Remote Markdown comparison uses a plugin you configure. Amber is needed only to [rebuild the script](#rebuild-from-source).
+The CLI and local mirror plugin use Bash and standard macOS commands. Amber is only needed to [rebuild from source](#rebuild-from-source).
 
 ## Requirements
+
+After installation, check that Bash and the commands the script needs are available on your Mac.
+
+```sh
+file-sync --check
+```
+
+When setting up a plugin for remote Markdown comparison, check the requirements for that plugin as well.
 
 The included shell script runs on macOS with Bash 3.2 or newer and system utilities including `/usr/bin/jq`, `/usr/bin/lockf`, and `/bin/realpath`. Local mirroring uses `/usr/bin/shasum` to detect changes. Markdown comparison uses `/usr/bin/diff` to show the patch.
 
@@ -18,15 +26,21 @@ The included script runs without Git, GitHub CLI (`gh`), or Homebrew. Remote com
 
 ## Quick start
 
-Run this from the checkout to start a mirror for a sample file. `--status` lists the source and the full path to the copy. The file remains available after `--stop`.
+Run this from the checkout in a temporary configuration. Set `mode` to `manual` to copy once with the same command.
 
 ```sh
+git submodule update --init -- plugins/github plugins/local-mirror
 export PATH="$PWD/bin:$PATH"
 demo=$(mktemp -d)
-printf '# Example\n\nOriginal text.\n' > "$demo/spec.md"
-file-sync mirror --to "$demo/mirror" -- "$demo/spec.md"
-file-sync mirror --status --to "$demo/mirror"
-file-sync mirror --stop --to "$demo/mirror"
+export FILE_SYNC_CONFIG_HOME="$demo/config" FILE_SYNC_STATE_HOME="$demo/state"
+mkdir -p "$demo/config/plugins" "$demo/config/jobs"
+jq -n --arg command "$PWD/plugins/local-mirror/plugin.sh" '{command:$command,protocol:"sync"}' > "$demo/config/plugins/local-mirror.json"
+printf 'example\n' > "$demo/note.txt"
+jq -n --arg src "$demo/note.txt" --arg dst "$demo/copies" \
+  '{plugin:"local-mirror",mode:"watch",settings:{files:[$src],destination:$dst}}' > "$demo/config/jobs/notes.json"
+file-sync run notes
+file-sync job-status notes
+file-sync stop notes
 ```
 
 ## Install the command
@@ -39,6 +53,18 @@ install -m 755 file-sync.sh "$HOME/.local/bin/file-sync"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+To run both standard plugins from this checkout, link their entry points and install their manifests. Company dotfiles perform this during installation.
+
+```sh
+git submodule update --init -- plugins/github plugins/local-mirror
+mkdir -p "$HOME/.config/file-sync/plugins"
+for name in github local-mirror; do
+  mkdir -p "$HOME/.tools/file-sync-plugins/$name"
+  ln -s "$PWD/plugins/$name/plugin" "$HOME/.tools/file-sync-plugins/$name/plugin"
+  cp -n "plugins/$name/manifest.json" "$HOME/.config/file-sync/plugins/$name.json"
+done
+```
+
 ## Compare Markdown with a remote copy
 
 [Configure a plugin](docs/external-spec.md#plugin-interface) to read from your service. With that plugin in place, link a local Markdown file to an HTTPS URL and inspect the differences.
@@ -49,7 +75,7 @@ file-sync status ./spec.md --diff
 file-sync pull ./spec.md
 ```
 
-`pull` previews changes and asks before applying them to the local file. `push` displays a patch and the remote URL. Apply the patch in your service, then rerun `push` to record the match.
+`pull` previews changes and asks before updating your file. `push` shows the patch and URL. With a writable plugin it asks for confirmation, applies the change and verifies the saved content. With a read-only plugin, apply the patch in the service and rerun `push` to record the match.
 
 ## Documentation
 
@@ -62,7 +88,8 @@ Use Amber 0.6.0-alpha and run these commands from the checkout.
 
 ```sh
 amber build --target bash-3.2 --no-proc bshchk src/main.ab file-sync.sh
-/bin/bash -n file-sync.sh
+(cd plugins/local-mirror && amber build --target bash-3.2 --no-proc bshchk src/main.ab plugin.sh)
+/bin/bash -n file-sync.sh && /bin/bash -n plugins/local-mirror/plugin.sh
 ```
 
 ## License

@@ -15,7 +15,8 @@ The CLI keeps target registrations, Markdown comparison records, and local mirro
 | [main.ab](../src/main.ab) | Read configuration roots, validate top-level arguments, and dispatch commands. |
 | [targets.ab](../src/targets.ab) | Read and update the registry, validate plugin configuration, and exchange JSON with the plugin. |
 | [sync.ab](../src/sync.ab) | Parse Markdown, compare snapshots, and save backup files and baselines. |
-| [mirror.ab](../src/mirror.ab) | Identify mirror sessions, start and stop the worker, and reconcile file pairs. |
+| [jobs.ab](../src/jobs.ab) | Load a named job, run one pass and manage watch workers. |
+| [plugins/local-mirror](../plugins/local-mirror) | Identify mirror sessions, start and stop the worker, and reconcile file pairs. |
 | [io.ab](../src/io.ab) | Resolve paths, acquire locks, and stage file updates. |
 
 Edit the Amber source and [rebuild the shell script](../README.md#rebuild-from-source).
@@ -24,7 +25,9 @@ Edit the Amber source and [rebuild the shell script](../README.md#rebuild-from-s
 
 - **F-001 Register sync targets.** The CLI canonicalizes the local path and uses the configured executable to resolve the URL. It checks for duplicate paths and URLs under the registry lock and writes the registry when the association changes.
 - **F-002 Compare and apply Markdown changes.** The CLI parses local Markdown and reads the plugin response. It compares the normalized title and body with the baseline for the registered target. A confirmed pull rereads both snapshots under the write lock, saves the current file as a backup, and stages the new file with the original mode. It records the baseline after confirming the saved title and body match the remote snapshot.
-- **F-003 Mirror local files.** The CLI keys the session by SHA-256 of the physical destination path. It validates the source and destination pairs, reconciles them once, and launches a worker using `nohup`. Each pass hashes the files with SHA-256 and compares the hashes with the last shared hash. Before replacing a file, the worker checks the staged copy and current target again.
+- **F-003 Mirror local files.** The local mirror plugin keys its records by SHA-256 of the physical destination path. Each pass compares the two hashes with the last shared hash. It rechecks the staged content and target before replacing a file.
+
+A named worker holds its startup configuration and checks it against the current job and manifest before each pass. The lock on `jobs/<name>/worker.lock` indicates liveness. A sibling `stop` marker requests shutdown. Each pass exits independently. Errors stop the worker with diagnostics in `worker.log`. The local reconciler is built as a separate executable plugin.
 
 ## Storage
 
@@ -35,15 +38,17 @@ Edit the Amber source and [rebuild the shell script](../README.md#rebuild-from-s
 | State | `state.json` | Array of `{target, baseline, syncedAt}` records keyed by the entire target object. The baseline holds `title` and `body`. |
 | State | `backup/` | Previous contents from pulls and mirror write-backs. |
 | State | `mirror/<key>/session.json` | Destination, direction, and file pairs with paths, baseline hashes, and any current problem. |
-| State | `mirror/<key>/worker.log` | Worker output and diagnostics. |
+| State | `jobs/<name>/worker.log` | Worker output and diagnostics. |
 
 ## Plugin process
 
 The CLI executes the configured path directly and sends [the request object](external-spec.md#plugin-interface) on standard input. It checks that standard output contains one versioned response with a result object, then validates the fields for the operation. A nonzero plugin exit or an invalid response aborts the action.
 
+For a writable plugin the CLI rereads both sides after confirmation, then calls `write`. On a successful receipt it takes the state write lock, rechecks the remote and local file, and records the verified baseline.
+
 ## Concurrency and recovery
 
-`.targets.lock` serializes mutations in one configuration root. `mirror/<key>/control.lock` serializes session commands. The worker holds `worker.lock` for its lifetime, which is how the CLI checks whether it is running. The stop command writes a `stop` marker. The worker checks for it before each pass and between pairs.
+`.targets.lock` serializes registration and Markdown changes. The local plugin uses `mirror/<key>/control.lock` to serialize passes for one destination. A stop request takes effect when the current plugin call finishes.
 
 A state root's `.write.lock` serializes Markdown updates and baseline writes with mirror reconciliation. Lock acquisition waits up to 15 seconds for the registry, control, and write locks. Writes use temporary sibling files and rename. A pull saves the Markdown and the baseline in separate steps. If it stops between them, the backup remains available and the baseline stays as it was. Review the comparison before retrying.
 

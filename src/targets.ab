@@ -43,6 +43,11 @@ pub fun load_plugin(config: Text, id: Text): Text {
         select(length == 1) | .[0] | select(type == "object"
           and (.command | type == "string" and (startswith("/") or startswith("~/"))
           and (test("[[:cntrl:]]") | not))
+          and (if has("writable") then (.writable | type == "boolean") else true end)
+          and ((.protocol // "markdown") | . == "markdown" or . == "sync")
+          and (if has("allowedModes") then (.allowedModes | type == "array" and length > 0
+            and all(.[]; . == "manual" or . == "watch")) else true end)
+          and (if has("backgroundWrite") then (.backgroundWrite | type == "boolean") else true end)
           and (if has("settings") then (.settings | type == "object") else true end))
     ' -- "{path}" $ failed { error("Invalid plugin configuration: {path}") }
     const command = $ /usr/bin/jq -er '.command' <<< "{manifest}" $ failed { error("Missing plugin command: {id}") }
@@ -51,17 +56,17 @@ pub fun load_plugin(config: Text, id: Text): Text {
         tool = $ value="{command}"; printf '%s/%s' "\$HOME" "\$\{value:2}" $ failed { error("Invalid plugin command: {id}") }
     }
     $ test -f "{tool}" && test -x "{tool}" $ failed { error("Plugin command is not executable: {tool}") }
-    const plugin = $ /usr/bin/jq -ce --arg tool "{tool}" '\{command:\$tool,settings:(.settings // \{})}' <<< "{manifest}" $ failed {
+    const plugin = $ /usr/bin/jq -ce --arg tool "{tool}" '\{command:\$tool,protocol:(.protocol // "markdown"),allowedModes:(.allowedModes // ["manual","watch"]),backgroundWrite:(.backgroundWrite // false),settings:(.settings // \{}),writable:(.writable // false)}' <<< "{manifest}" $ failed {
         error("Could not read plugin settings: {id}")
     }
     return plugin
 }
 
-pub fun plugin_call(plugin: Text, operation: Text, url: Text): Text {
+pub fun plugin_call(plugin: Text, operation: Text, url: Text, payload: Text = "\{}"): Text {
     const tool = $ /usr/bin/jq -er '.command' <<< "{plugin}" $ failed { error("Missing plugin command") }
-    const request = $ /usr/bin/jq -ce --arg op "{operation}" --arg url "{url}" '
-        \{version:1, operation:\$op, url:\$url, settings}
-    ' <<< "{plugin}" $ failed { error("Could not build plugin request") }
+    const request = $ printf '%s\n' "{plugin}" "{payload}" | /usr/bin/jq -ces --arg op "{operation}" --arg url "{url}" '
+        .[1] + (.[0] | \{version:1, operation:\$op, settings}) + (if \$op == "sync" then \{} else \{url:\$url} end)
+    ' $ failed { error("Could not build plugin request") }
     const response = $ printf '%s\n' "{request}" | "{tool}" $ failed { error("Plugin failed: {operation}") }
     const result = $ printf '%s' "{response}" | /usr/bin/jq -ces '
         select(length == 1) | .[0] | select(.version == 1 and (.result | type == "object")) | .result

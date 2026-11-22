@@ -1,0 +1,6 @@
+[submodule "plugins/github"]
+	path = plugins/github
+	url = ../file-sync-github.git
+[submodule "plugins/local-mirror"]
+	path = plugins/local-mirror
+	url = ../file-sync-local-mirror.git
