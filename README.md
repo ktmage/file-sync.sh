@@ -6,13 +6,15 @@
 
 [日本語](README.ja.md)
 
-A macOS CLI for keeping copies of local files up to date and comparing local Markdown with a remote copy. Local mirroring works immediately. Remote comparisons use a plugin executable you configure.
+A macOS CLI for keeping copies of local files up to date and comparing local Markdown with a remote copy.
+
+**Local mirroring runs with Bash and standard macOS commands.** Remote Markdown comparison uses a plugin you configure. Amber is needed only to [rebuild the script](#rebuild-from-source).
 
 ## Requirements
 
-- macOS with Bash 3.2 or newer and the system utilities `/usr/bin/jq`, `/usr/bin/lockf`, `/bin/realpath`, and `/usr/bin/shasum`.
+The included shell script runs on macOS with Bash 3.2 or newer and system utilities including `/usr/bin/jq`, `/usr/bin/lockf`, and `/bin/realpath`. Local mirroring uses `/usr/bin/shasum` to detect changes. Markdown comparison uses `/usr/bin/diff` to show the patch.
 
-The checkout includes the generated shell script. Amber is needed only to [rebuild it](#rebuild-from-source).
+The included script runs without Git, GitHub CLI (`gh`), or Homebrew. Remote comparison also requires a [plugin executable](docs/external-spec.md#plugin-interface) and any tools that plugin calls.
 
 ## Quick start
 

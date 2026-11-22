@@ -6,13 +6,15 @@
 
 [English](README.md)
 
-ローカルファイルのコピーを最新に保ち、手元のMarkdownと同期先の差分を確認するmacOS向けCLIです。ローカルのミラーはすぐに使えます。同期先との比較には、サービスに対応するプラグインを設定します。
+ローカルファイルのコピーを最新に保ち、手元のMarkdownと同期先の差分を確認するmacOS向けCLIです。
+
+**ローカルのミラーはBashとmacOS標準コマンドで動きます。** 同期先のMarkdownとの比較には、サービスに対応するプラグインを使います。Amberが必要なのは[ソースからビルドする](#ソースからビルドする)ときだけです。
 
 ## 動作環境
 
-- Bash 3.2以降と、標準コマンド`/usr/bin/jq`、`/usr/bin/lockf`、`/bin/realpath`、`/usr/bin/shasum`を備えたmacOS。
+同梱のシェルスクリプトは、Bash 3.2以降と`/usr/bin/jq`、`/usr/bin/lockf`、`/bin/realpath`などの標準コマンドが使えるmacOSで動作します。ミラーでは`/usr/bin/shasum`で変更を検出し、Markdownの比較では`/usr/bin/diff`で差分を出します。
 
-生成済みのシェルスクリプトを同梱しています。Amberが必要なのは[ソースからビルド](#ソースからビルドする)するときだけです。
+同梱のスクリプトの実行にGit、GitHub CLI（`gh`）、Homebrewは不要です。同期先のMarkdownを比較する場合は、[プラグインの実行ファイル](docs/external-spec.ja.md#プラグインとの通信)と、そのプラグインが呼び出すコマンドを用意します。
 
 ## 使ってみる
 
